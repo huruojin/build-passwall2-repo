@@ -239,7 +239,7 @@ jobs:
             --title "PassWall2 APK repo - ${TAG}" \
             --notes "UPSTREAM_VERSION=${TAG}
 
-          OpenWrt 24.10+/25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
+          OpenWrt 25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
 
           - **Online feed**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ (see README)
           - **Offline snapshots**: per-arch zips below" \
