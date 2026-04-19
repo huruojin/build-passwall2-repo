@@ -1,0 +1,250 @@
+name: Build PassWall2 APK Repo
+
+on:
+  schedule:
+    - cron: '20 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Force rebuild even if upstream version unchanged
+        type: boolean
+        default: false
+
+concurrency:
+  group: "build-repo"
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: Openwrt-Passwall/openwrt-passwall2
+  ARCHES: x86_64 aarch64_cortex-a53 aarch64_generic
+  ROLLING_TAG: repo
+  PUBKEY_NAME: passwall2-repo.rsa.pub
+  LANGS: zh-cn zh-tw
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch upstream latest tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh release view --repo "${UPSTREAM_REPO}" --json tagName -q '.tagName')
+          [ -n "$TAG" ] || { echo "::error::Could not resolve upstream latest tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest: $TAG"
+
+      - name: Decide whether to rebuild
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CUR=$(gh release view "$ROLLING_TAG" --repo "${{ github.repository }}" \
+                  --json body --jq '.body' 2>/dev/null \
+                  | grep -oE 'UPSTREAM_VERSION=\S+' | cut -d= -f2 || true)
+          echo "Current rolling release tracks: ${CUR:-<none>}"
+          if [ "${{ inputs.force }}" = "true" ] || [ "$CUR" != "${{ steps.upstream.outputs.tag }}" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already up to date ($CUR); nothing to do."
+          fi
+
+      - name: Restore private key, derive public key
+        if: steps.state.outputs.go == 'true'
+        env:
+          KEY: ${{ secrets.APK_SIGN_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::Secret APK_SIGN_PRIVATE_KEY is not set."
+            exit 1
+          fi
+          mkdir -p keys
+          printf '%s\n' "$KEY" > keys/private.pem
+          chmod 600 keys/private.pem
+          openssl rsa -in keys/private.pem -pubout -out "keys/${PUBKEY_NAME}" 2>/dev/null
+
+      - name: Download arch-independent packages
+        if: steps.state.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -eu
+          mkdir -p common
+          
+          echo "Downloading main app..."
+          gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "luci-app-passwall2-[0-9]*.apk" --dir common
+          
+          echo "Downloading language packs..."
+          for L in $LANGS; do
+            gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "luci-i18n-passwall2-${L}-*.apk" --dir common || echo "  skip ${L} (not in release)"
+          done
+          
+          echo "Common apks:"
+          ls -la common/
+
+      - name: Build per-arch repos
+        if: steps.state.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -eu
+          mkdir -p site zips
+          cp "keys/${PUBKEY_NAME}" "site/${PUBKEY_NAME}"
+
+          for ARCH in $ARCHES; do
+            echo "::group::Prepare ${ARCH}"
+            ARCHDIR="site/${ARCH}"
+            mkdir -p "$ARCHDIR"
+
+            if gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "passwall_packages_apk_${ARCH}.zip" --dir "$ARCHDIR" 2>/dev/null; then
+              ZIP_FILE="$ARCHDIR/passwall_packages_apk_${ARCH}.zip"
+              (cd "$ARCHDIR" && unzip -j -q "$(basename "$ZIP_FILE")" && rm "$(basename "$ZIP_FILE")")
+            else
+              echo "::warning::No deps zip for ${ARCH}, skipping"
+              rm -rf "$ARCHDIR"
+              echo "::endgroup::"
+              continue
+            fi
+
+            cp common/*.apk "$ARCHDIR/"
+            echo "Packages in ${ARCH}: $(ls -1 "$ARCHDIR"/*.apk | wc -l)"
+            echo "::endgroup::"
+          done
+
+          echo "::group::Sign APK indexes"
+          docker run --rm \
+            -v "$PWD/site:/site" \
+            -v "$PWD/keys:/keys:ro" \
+            -e TAG="$TAG" \
+            -e ARCHES="$ARCHES" \
+            alpine:edge \
+            sh -eu -c '
+              apk add --no-cache apk-tools >/dev/null
+              for ARCH in $ARCHES; do
+                if [ -d "/site/$ARCH" ]; then
+                  echo "Signing $ARCH..."
+                  cd "/site/$ARCH"
+                  apk mkndx \
+                    --allow-untrusted \
+                    --output packages.adb \
+                    --sign-key /keys/private.pem \
+                    --description "passwall2-${ARCH}-${TAG}" \
+                    *.apk
+                fi
+              done
+            '
+          echo "::endgroup::"
+
+          echo "::group::Create zip snapshots"
+          for ARCH in $ARCHES; do
+            if [ -d "site/${ARCH}" ]; then
+              (cd site && zip -qr "../zips/passwall2-${ARCH}-${TAG}.zip" "${ARCH}")
+            fi
+          done
+          echo "::endgroup::"
+
+          echo "Site layout:"
+          find site -maxdepth 2 -type f | sort
+          echo "Zip snapshots:"
+          ls -la zips/
+
+      - name: Write site README
+        if: steps.state.outputs.go == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          REL_URL="https://github.com/${{ github.repository }}/releases/download/${ROLLING_TAG}"
+
+          {
+            echo "# PassWall2 APK repository"
+            echo ""
+            echo "Rebuilt mirror of [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) **${TAG}**,"
+            echo "signed as OpenWrt 25.12 APK feeds. Check for upstream updates every 4 hours."
+            echo ""
+            echo "## Online feed (recommended)"
+            echo ""
+            echo "Pick the URL matching your router's architecture; register the **full packages.adb URL**"
+            echo "explicitly to avoid apk's legacy \`APKINDEX.tar.gz\` fallback warning:"
+            echo ""
+            echo "| Arch | Feed URL |"
+            echo "|---|---|"
+            for ARCH in $ARCHES; do
+              [ -d "site/${ARCH}" ] && echo "| \`${ARCH}\` | \`${PAGES_URL}/${ARCH}/packages.adb\` |"
+            done
+            echo ""
+            echo '```sh'
+            echo "# 1. Trust this repo's signing key (one time)"
+            echo "wget -O /etc/apk/keys/${PUBKEY_NAME} \\"
+            echo "    ${PAGES_URL}/${PUBKEY_NAME}"
+            echo ""
+            echo "# 2. Register the feed (replace <arch>)"
+            echo "echo \"${PAGES_URL}/<arch>/packages.adb\" >> /etc/apk/repositories.d/customfeeds.list"
+            echo ""
+            echo "# 3. Install"
+            echo "apk update"
+            echo "apk add luci-app-passwall2"
+            echo "apk add luci-i18n-passwall2-zh-cn"
+            echo "/etc/init.d/rpcd restart"
+            echo '```'
+            echo ""
+            echo "## Offline snapshot"
+            echo ""
+            echo "Per-arch zip archives on the [\`${ROLLING_TAG}\`](${REL_URL%/download/*}/tag/${ROLLING_TAG}) release:"
+            echo ""
+            for ARCH in $ARCHES; do
+              [ -f "zips/passwall2-${ARCH}-${TAG}.zip" ] && \
+                echo "- [passwall2-${ARCH}-${TAG}.zip](${REL_URL}/passwall2-${ARCH}-${TAG}.zip)"
+            done
+            echo ""
+            echo "Extract, put the directory somewhere webserver-reachable, and point apk at its \`packages.adb\`."
+          } > site/README.md
+
+          cp site/README.md zips/README.md
+
+      - name: Publish to gh-pages
+        if: steps.state.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          cd site
+          touch .nojekyll
+          git init -q -b gh-pages
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -q -m "passwall2 ${TAG}"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages
+          echo "Pushed to gh-pages. Pages will update in ~1 min at:"
+          echo "  https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+
+      - name: Replace rolling release
+        if: steps.state.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          gh release delete "$ROLLING_TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create "$ROLLING_TAG" \
+            --repo "${{ github.repository }}" \
+            --title "PassWall2 APK repo - ${TAG}" \
+            --notes "UPSTREAM_VERSION=${TAG}
+
+          OpenWrt 24.10+/25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
+
+          - **Online feed**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ (see README)
+          - **Offline snapshots**: per-arch zips below" \
+            zips/*.zip \
+            "keys/${PUBKEY_NAME}" \
+            zips/README.md
+
+          echo "Published: https://github.com/${{ github.repository }}/releases/tag/${ROLLING_TAG}"
