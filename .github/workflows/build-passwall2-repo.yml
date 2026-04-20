@@ -17,7 +17,6 @@ concurrency:
 env:
   UPSTREAM_REPO: Openwrt-Passwall/openwrt-passwall2
   ARCHES: x86_64 aarch64_cortex-a53 aarch64_generic
-  ROLLING_TAG: repo
   PUBKEY_NAME: passwall2-repo.rsa.pub
   LANGS: zh-cn zh-tw
 
@@ -42,16 +41,20 @@ jobs:
         id: state
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          CUR=$(gh release view "$ROLLING_TAG" --repo "${{ github.repository }}" \
-                  --json body --jq '.body' 2>/dev/null \
-                  | grep -oE 'UPSTREAM_VERSION=\S+' | cut -d= -f2 || true)
-          echo "Current rolling release tracks: ${CUR:-<none>}"
-          if [ "${{ inputs.force }}" = "true" ] || [ "$CUR" != "${{ steps.upstream.outputs.tag }}" ]; then
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            CUR="$TAG"
+          else
+            CUR="<none>"
+          fi
+          
+          echo "Current matching release in this repo: ${CUR}"
+          if [ "${{ inputs.force }}" = "true" ] || [ "$CUR" != "$TAG" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Already up to date ($CUR); nothing to do."
+            echo "::notice::Already up to date ($TAG); nothing to do."
           fi
 
       - name: Restore private key, derive public key
@@ -161,7 +164,7 @@ jobs:
           TAG: ${{ steps.upstream.outputs.tag }}
         run: |
           PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
-          REL_URL="https://github.com/${{ github.repository }}/releases/download/${ROLLING_TAG}"
+          REL_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}"
 
           {
             echo "# PassWall2 APK repository"
@@ -197,7 +200,7 @@ jobs:
             echo ""
             echo "## Offline snapshot"
             echo ""
-            echo "Per-arch zip archives on the [\`${ROLLING_TAG}\`](${REL_URL%/download/*}/tag/${ROLLING_TAG}) release:"
+            echo "Per-arch zip archives on the [\`${TAG}\`](${REL_URL%/download/*}/tag/${TAG}) release:"
             echo ""
             for ARCH in $ARCHES; do
               [ -f "zips/passwall2-${ARCH}-${TAG}.zip" ] && \
@@ -226,20 +229,16 @@ jobs:
           echo "Pushed to gh-pages. Pages will update in ~1 min at:"
           echo "  https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
 
-      - name: Replace rolling release
+      - name: Create release
         if: steps.state.outputs.go == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          gh release delete "$ROLLING_TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
-
-          gh release create "$ROLLING_TAG" \
+          gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "PassWall2 APK repo - ${TAG}" \
-            --notes "UPSTREAM_VERSION=${TAG}
-
-          OpenWrt 25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
+            --notes "OpenWrt 25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
 
           - **Online feed**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ (see README)
           - **Offline snapshots**: per-arch zips below" \
@@ -247,4 +246,4 @@ jobs:
             "keys/${PUBKEY_NAME}" \
             zips/README.md
 
-          echo "Published: https://github.com/${{ github.repository }}/releases/tag/${ROLLING_TAG}"
+          echo "Published: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
