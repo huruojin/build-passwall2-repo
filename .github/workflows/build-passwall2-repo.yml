@@ -237,7 +237,7 @@ jobs:
         run: |
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
-            --title "PassWall2 APK repo - ${TAG}" \
+            --title "${TAG}" \
             --notes "OpenWrt 25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
 
           - **Online feed**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ (see README)
