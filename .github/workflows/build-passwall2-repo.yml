@@ -135,7 +135,6 @@ jobs:
                   echo "Signing $ARCH..."
                   cd "/site/$ARCH"
                   apk mkndx \
-                    --allow-untrusted \
                     --output packages.adb \
                     --sign-key /keys/private.pem \
                     --description "passwall2-${ARCH}-${TAG}" \
