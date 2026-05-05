@@ -43,18 +43,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.upstream.outputs.tag }}
         run: |
+          EXISTS=false
+          MISSING_ARCHES=""
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            EXISTS=true
             CUR="$TAG"
+            ASSETS=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name')
+            for ARCH in $ARCHES; do
+              if ! printf '%s\n' "$ASSETS" | grep -qx "passwall2-${ARCH}-${TAG}.zip"; then
+                MISSING_ARCHES="${MISSING_ARCHES} ${ARCH}"
+              fi
+            done
           else
             CUR="<none>"
           fi
-          
+
           echo "Current matching release in this repo: ${CUR}"
-          if [ "${{ inputs.force }}" = "true" ] || [ "$CUR" != "$TAG" ]; then
+          if [ -n "$MISSING_ARCHES" ]; then
+            echo "::notice::Existing release ${TAG} is missing arches:${MISSING_ARCHES}; will rebuild"
+          fi
+
+          if [ "${{ inputs.force }}" = "true" ] || [ "$EXISTS" != "true" ] || [ -n "$MISSING_ARCHES" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Already up to date ($TAG); nothing to do."
+            echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already up to date ($TAG) with all arches; nothing to do."
           fi
 
       - name: Restore private key, derive public key
@@ -106,11 +121,21 @@ jobs:
             ARCHDIR="site/${ARCH}"
             mkdir -p "$ARCHDIR"
 
-            if gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "passwall_packages_apk_${ARCH}.zip" --dir "$ARCHDIR" 2>/dev/null; then
+            DOWNLOADED=false
+            for ATTEMPT in 1 2; do
+              if gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "passwall_packages_apk_${ARCH}.zip" --dir "$ARCHDIR" 2>/dev/null; then
+                DOWNLOADED=true
+                break
+              fi
+              echo "::warning::Attempt ${ATTEMPT} to download deps zip for ${ARCH} failed"
+              [ "$ATTEMPT" -lt 2 ] && sleep 5
+            done
+
+            if [ "$DOWNLOADED" = "true" ]; then
               ZIP_FILE="$ARCHDIR/passwall_packages_apk_${ARCH}.zip"
               (cd "$ARCHDIR" && unzip -j -q "$(basename "$ZIP_FILE")" && rm "$(basename "$ZIP_FILE")")
             else
-              echo "::warning::No deps zip for ${ARCH}, skipping"
+              echo "::warning::No deps zip for ${ARCH} after retries, skipping"
               rm -rf "$ARCHDIR"
               echo "::endgroup::"
               continue
@@ -234,15 +259,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
-            --title "${TAG}" \
-            --notes "OpenWrt 25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
+          NOTES="OpenWrt 25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
 
           - **Online feed**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ (see README)
-          - **Offline snapshots**: per-arch zips below" \
-            zips/*.zip \
-            "keys/${PUBKEY_NAME}" \
-            zips/README.md
+          - **Offline snapshots**: per-arch zips below"
+
+          if [ "${{ steps.state.outputs.exists }}" = "true" ]; then
+            echo "Existing release ${TAG} found; updating assets in place"
+            gh release edit "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "${TAG}" \
+              --notes "$NOTES"
+            gh release upload "$TAG" \
+              --repo "${{ github.repository }}" \
+              --clobber \
+              zips/*.zip \
+              "keys/${PUBKEY_NAME}" \
+              zips/README.md
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "${TAG}" \
+              --notes "$NOTES" \
+              zips/*.zip \
+              "keys/${PUBKEY_NAME}" \
+              zips/README.md
+          fi
 
           echo "Published: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
