@@ -19,6 +19,7 @@ env:
   ARCHES: x86_64 aarch64_cortex-a53 aarch64_generic
   PUBKEY_NAME: passwall2-repo.rsa.pub
   LANGS: zh-cn zh-tw
+  GH_TOKEN: ${{ github.token }}
 
 permissions:
   contents: write
@@ -27,28 +28,50 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Setup retry function
+        run: |
+          cat << 'EOF' > /tmp/retry.sh
+          with_retry() {
+            local max_attempts=3
+            local timeout=5
+            local attempt=1
+            local exitCode=0
+            while [ $attempt -le $max_attempts ]; do
+              if "$@"; then
+                return 0
+              else
+                exitCode=$?
+                echo "::warning::Command '$1' failed with exit code $exitCode. Attempt $attempt of $max_attempts." >&2
+                if [ $attempt -lt $max_attempts ]; then
+                  sleep $timeout
+                fi
+              fi
+              attempt=$((attempt + 1))
+            done
+            echo "::error::Command '$1' failed after $max_attempts attempts." >&2
+            return $exitCode
+          }
+          EOF
+
       - name: Fetch upstream latest tag
         id: upstream
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG=$(gh release view --repo "${UPSTREAM_REPO}" --json tagName -q '.tagName')
+          source /tmp/retry.sh
+          TAG=$(with_retry gh release view --repo "${UPSTREAM_REPO}" --json tagName -q '.tagName')
           [ -n "$TAG" ] || { echo "::error::Could not resolve upstream latest tag"; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "Upstream latest: $TAG"
 
       - name: Decide whether to rebuild
         id: state
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
+          source /tmp/retry.sh
           EXISTS=false
           MISSING_ARCHES=""
-          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          if ASSETS=$(with_retry gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' 2>/dev/null); then
             EXISTS=true
             CUR="$TAG"
-            ASSETS=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name')
             for ARCH in $ARCHES; do
               if ! printf '%s\n' "$ASSETS" | grep -qx "passwall2-${ARCH}-${TAG}.zip"; then
                 MISSING_ARCHES="${MISSING_ARCHES} ${ARCH}"
@@ -88,19 +111,17 @@ jobs:
 
       - name: Download arch-independent packages
         if: steps.state.outputs.go == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
+          source /tmp/retry.sh
           set -eu
           mkdir -p common
           
           echo "Downloading main app..."
-          gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "luci-app-passwall2-[0-9]*.apk" --dir common
+          with_retry gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "luci-app-passwall2-[0-9]*.apk" --dir common
           
           echo "Downloading language packs..."
           for L in $LANGS; do
-            gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "luci-i18n-passwall2-${L}-*.apk" --dir common || echo "  skip ${L} (not in release)"
+            with_retry gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "luci-i18n-passwall2-${L}-*.apk" --dir common || echo "  skip ${L} (not in release)"
           done
           
           echo "Common apks:"
@@ -108,10 +129,8 @@ jobs:
 
       - name: Build per-arch repos
         if: steps.state.outputs.go == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
+          source /tmp/retry.sh
           set -eu
           mkdir -p site zips
           cp "keys/${PUBKEY_NAME}" "site/${PUBKEY_NAME}"
@@ -121,27 +140,32 @@ jobs:
             ARCHDIR="site/${ARCH}"
             mkdir -p "$ARCHDIR"
 
-            DOWNLOADED=false
-            for ATTEMPT in 1 2; do
-              if gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "passwall_packages_apk_${ARCH}.zip" --dir "$ARCHDIR" 2>/dev/null; then
-                DOWNLOADED=true
-                break
-              fi
-              echo "::warning::Attempt ${ATTEMPT} to download deps zip for ${ARCH} failed"
-              [ "$ATTEMPT" -lt 2 ] && sleep 5
-            done
-
-            if [ "$DOWNLOADED" = "true" ]; then
-              ZIP_FILE="$ARCHDIR/passwall_packages_apk_${ARCH}.zip"
-              (cd "$ARCHDIR" && unzip -j -q "$(basename "$ZIP_FILE")" && rm "$(basename "$ZIP_FILE")")
+            DOWNLOAD_SUCCESS=false
+            if with_retry gh release download "$TAG" --repo "${UPSTREAM_REPO}" --pattern "passwall_packages_apk_${ARCH}.zip" --dir "$ARCHDIR"; then
+              DOWNLOAD_SUCCESS=true
             else
-              echo "::warning::No deps zip for ${ARCH} after retries, skipping"
+              echo "::warning::Deps zip not found in ${TAG} for ${ARCH}. Searching older releases..."
+              FALLBACK_TAG=$(with_retry gh api repos/${UPSTREAM_REPO}/releases 2>/dev/null | jq -r "map(select(.assets != null and (.assets | map(.name) | contains([\"passwall_packages_apk_${ARCH}.zip\"])))) | .[0].tag_name // \"null\"")
+              if [ "$FALLBACK_TAG" != "null" ] && [ -n "$FALLBACK_TAG" ]; then
+                echo "::notice::Found fallback tag ${FALLBACK_TAG} for ${ARCH}, downloading..."
+                if with_retry gh release download "$FALLBACK_TAG" --repo "${UPSTREAM_REPO}" --pattern "passwall_packages_apk_${ARCH}.zip" --dir "$ARCHDIR"; then
+                  DOWNLOAD_SUCCESS=true
+                fi
+              fi
+            fi
+
+            if [ "$DOWNLOAD_SUCCESS" = "true" ]; then
+              ZIP_FILE="$ARCHDIR/passwall_packages_apk_${ARCH}.zip"
+              unzip -j -q "$ZIP_FILE" -d "$ARCHDIR"
+              rm "$ZIP_FILE"
+            else
+              echo "::warning::No deps zip for ${ARCH} after retries and fallback, skipping"
               rm -rf "$ARCHDIR"
               echo "::endgroup::"
               continue
             fi
 
-            cp common/*.apk "$ARCHDIR/"
+            cp -l common/*.apk "$ARCHDIR/" 2>/dev/null || cp common/*.apk "$ARCHDIR/"
             echo "Packages in ${ARCH}: $(ls -1 "$ARCHDIR"/*.apk | wc -l)"
             echo "::endgroup::"
           done
@@ -182,10 +206,14 @@ jobs:
           echo "Zip snapshots:"
           ls -la zips/
 
+          ZIP_COUNT=$(find zips -maxdepth 1 -name "*.zip" | wc -l)
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo "::error::所有架构均构建失败，已中止后续更新以保护原有页面和 Release。"
+            exit 1
+          fi
+
       - name: Write site README
         if: steps.state.outputs.go == 'true'
-        env:
-          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
           PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           REL_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}"
@@ -238,10 +266,8 @@ jobs:
 
       - name: Publish to gh-pages
         if: steps.state.outputs.go == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
+          source /tmp/retry.sh
           cd site
           touch .nojekyll
           git init -q -b gh-pages
@@ -249,16 +275,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git add -A
           git commit -q -m "passwall2 ${TAG}"
-          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages
+          with_retry git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages
           echo "Pushed to gh-pages. Pages will update in ~1 min at:"
           echo "  https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
 
       - name: Create release
         if: steps.state.outputs.go == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
+          source /tmp/retry.sh
           NOTES="OpenWrt 25.12 APK repo (multi-arch), rebuilt from **${UPSTREAM_REPO} ${TAG}**.
 
           - **Online feed**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ (see README)
@@ -266,18 +290,18 @@ jobs:
 
           if [ "${{ steps.state.outputs.exists }}" = "true" ]; then
             echo "Existing release ${TAG} found; updating assets in place"
-            gh release edit "$TAG" \
+            with_retry gh release edit "$TAG" \
               --repo "${{ github.repository }}" \
               --title "${TAG}" \
               --notes "$NOTES"
-            gh release upload "$TAG" \
+            with_retry gh release upload "$TAG" \
               --repo "${{ github.repository }}" \
               --clobber \
               zips/*.zip \
               "keys/${PUBKEY_NAME}" \
               zips/README.md
           else
-            gh release create "$TAG" \
+            with_retry gh release create "$TAG" \
               --repo "${{ github.repository }}" \
               --title "${TAG}" \
               --notes "$NOTES" \
